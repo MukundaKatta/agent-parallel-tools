@@ -1,11 +1,13 @@
 """
 agent-parallel-tools: Run multiple tool calls in parallel, results in original order.
 """
+
 from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 
@@ -59,13 +61,21 @@ class ParallelToolRunner:
         self._registry[name] = fn
         return self
 
-    def run(self, calls: list[ToolCall], timeout: Optional[float] = None) -> list[ToolResult]:
+    def run(
+        self, calls: list[ToolCall], timeout: Optional[float] = None
+    ) -> list[ToolResult]:
         """
-        Execute all calls concurrently. Returns results in original order.
-        Raises KeyError for unregistered tools (before starting any threads).
+        Execute all calls concurrently. Returns one :class:`ToolResult` per call,
+        in the original call order.
+
+        ``timeout`` (seconds) is an overall deadline for the whole batch. Calls
+        that have not finished by the deadline are reported with a
+        :class:`TimeoutError` instead of being dropped, so the returned list
+        always has the same length and order as ``calls``.
+
+        Raises ``KeyError`` for unregistered tools (before starting any threads).
         """
         for call in calls:
-            call.index = calls.index(call)
             if call.name not in self._registry:
                 raise KeyError(f"Tool not registered: {call.name!r}")
 
@@ -80,7 +90,6 @@ class ParallelToolRunner:
             work_q.put(call)
 
         def worker() -> None:
-            import time
             while True:
                 try:
                     call = work_q.get_nowait()
@@ -91,18 +100,38 @@ class ParallelToolRunner:
                 try:
                     result = fn(**call.args)
                     duration = (time.monotonic() - t0) * 1000
-                    results[call.index] = ToolResult(call=call, result=result, duration_ms=duration)
+                    results[call.index] = ToolResult(
+                        call=call, result=result, duration_ms=duration
+                    )
                 except Exception as exc:
                     duration = (time.monotonic() - t0) * 1000
-                    results[call.index] = ToolResult(call=call, error=exc, duration_ms=duration)
+                    results[call.index] = ToolResult(
+                        call=call, error=exc, duration_ms=duration
+                    )
                 finally:
                     work_q.task_done()
 
         threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
         for t in threads:
             t.start()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
         for t in threads:
-            t.join(timeout=timeout)
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            t.join(timeout=remaining)
+
+        # Fill in any calls that did not finish before the deadline so the
+        # returned list always matches the input length and order.
+        for i, (call, res) in enumerate(zip(calls, results)):
+            if res is None:
+                results[i] = ToolResult(
+                    call=call,
+                    error=TimeoutError(
+                        f"Tool {call.name!r} did not finish within {timeout}s"
+                    ),
+                )
 
         return [r for r in results if r is not None]
 

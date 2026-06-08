@@ -1,4 +1,5 @@
 """Tests for agent-parallel-tools."""
+
 import time
 import pytest
 from agent_parallel_tools import ParallelToolRunner, ToolCall, ToolResult, run_parallel
@@ -86,7 +87,10 @@ def test_run_one():
 
 def test_run_parallel_convenience():
     results = run_parallel(
-        [{"name": "add", "args": {"x": 1, "y": 2}}, {"name": "mul", "args": {"x": 3, "y": 4}}],
+        [
+            {"name": "add", "args": {"x": 1, "y": 2}},
+            {"name": "mul", "args": {"x": 3, "y": 4}},
+        ],
         registry={"add": lambda x, y: x + y, "mul": lambda x, y: x * y},
     )
     assert len(results) == 2
@@ -101,3 +105,39 @@ def test_result_order_preserved_parallel():
     calls = [ToolCall("fast", {"n": i}) for i in range(5)]
     results = runner.run(calls)
     assert [r.result for r in results] == [0, 1, 2, 3, 4]
+
+
+def test_tool_result_public_api():
+    call = ToolCall("noop", {})
+    ok_result = ToolResult(call=call, result=42)
+    assert ok_result.ok is True
+    assert ok_result.name == "noop"
+    assert ok_result.result == 42
+
+    err = ValueError("bad")
+    bad_result = ToolResult(call=call, error=err)
+    assert bad_result.ok is False
+    assert bad_result.error is err
+
+
+def test_timeout_does_not_drop_results():
+    # A call that exceeds the deadline must still appear in the results, in
+    # order, reported as a TimeoutError rather than being silently dropped.
+    runner = ParallelToolRunner(max_workers=2)
+    runner.register("slow", lambda d: time.sleep(d) or f"slept {d}")
+    calls = [ToolCall("slow", {"d": 0.0}), ToolCall("slow", {"d": 0.5})]
+    results = runner.run(calls, timeout=0.1)
+    assert len(results) == 2
+    assert results[0].ok is True
+    assert results[0].result == "slept 0.0"
+    assert results[1].ok is False
+    assert isinstance(results[1].error, TimeoutError)
+
+
+def test_duplicate_equal_calls_preserve_order():
+    # Two ToolCall instances that compare equal must not collapse to one index.
+    runner = ParallelToolRunner()
+    runner.register("echo", lambda v: v)
+    calls = [ToolCall("echo", {"v": 1}), ToolCall("echo", {"v": 1})]
+    results = runner.run(calls)
+    assert [r.result for r in results] == [1, 1]
